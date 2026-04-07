@@ -16,13 +16,13 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * 统一管理层，负责：
  * 1. 会话的获取、创建、缓存
- * 2. 消息的追加（自动同步到 JSONL）
- * 3. 上下文的构建（从 JSONL 读取）
+ * 2. Entry 的内存缓存和持久化（JSONL）
+ * 3. 上下文的构建（优先从内存读取）
  *
  * 【设计原则】：
- * - JSONL 文件是真相源
- * - Session 对象只保留元数据，不保存消息
- * - 所有消息操作通过此管理器，自动同步到文件
+ * - Session 对象内存中缓存所有 entry
+ * - JSONL 文件作为持久化备份
+ * - 读取 entry 优先从内存获取，内存未命中则从 JSONL 加载
  */
 @Slf4j
 public class SessionManager {
@@ -85,13 +85,17 @@ public class SessionManager {
     /**
      * 【加载已有会话】
      *
-     * 从 JSONL 文件加载会话元数据
+     * 从 JSONL 文件加载会话元数据和所有 entry
      */
     private Session loadExistingSession(String key) {
         Session session = new Session(key);
 
-        // 从 JSONL 读取 header 获取元数据
+        // 从 JSONL 读取所有 entry
         JsonlSessionStore store = getJsonlStore(key);
+        List<SessionEntry> allEntries = store.readAllEntries();
+        session.setEntries(allEntries);
+
+        // 从 header 获取元数据
         SessionEntry header = store.readHeader();
         if (header != null && header.getMetadata() != null) {
             session.setMetadata(header.getMetadata());
@@ -106,7 +110,7 @@ public class SessionManager {
             }
         }
 
-        log.info("[SessionManager] 加载已有会话: {}", key);
+        log.info("[SessionManager] 加载已有会话: {} ({} entries)", key, allEntries.size());
         return session;
     }
 
@@ -123,6 +127,7 @@ public class SessionManager {
             .metadata(Map.of("created_at", Instant.now().toString()))
             .build();
         store.appendEntry(header);
+        session.addEntry(header);
 
         log.info("[SessionManager] 创建新会话: {}", key);
         return session;
@@ -156,13 +161,123 @@ public class SessionManager {
         JsonlSessionStore store = getJsonlStore(sessionKey);
         String id = store.appendMessage(role, content);
 
-        // 更新会话的访问时间
+        // 同时添加到内存缓存
         Session session = cache.get(sessionKey);
         if (session != null) {
             session.touch();
+            SessionEntry entry = SessionEntry.builder()
+                .type(SessionEntry.EntryType.MESSAGE)
+                .role(role)
+                .content(content)
+                .timestamp(Instant.now().toString())
+                .build();
+            session.addEntry(entry);
         }
 
         return id;
+    }
+
+    /**
+     * 【追加消息到会话（带 totalTokens）】
+     *
+     * @param sessionKey 会话键
+     * @param role 角色（user/assistant/system）
+     * @param content 内容
+     * @param totalTokens 累计的总 Token 数
+     * @return 消息 ID
+     */
+    public String appendMessage(String sessionKey, String role, String content,
+                                Integer totalTokens) {
+        JsonlSessionStore store = getJsonlStore(sessionKey);
+        String id = store.appendMessage(role, content, totalTokens);
+
+        // 同时添加到内存缓存
+        Session session = cache.get(sessionKey);
+        if (session != null) {
+            session.touch();
+            SessionEntry entry = SessionEntry.builder()
+                .type(SessionEntry.EntryType.MESSAGE)
+                .role(role)
+                .content(content)
+                .totalTokens(totalTokens)
+                .timestamp(Instant.now().toString())
+                .build();
+            session.addEntry(entry);
+        }
+
+        return id;
+    }
+
+    /**
+     * 【追加压缩标记 Entry】
+     *
+     * 同时写入 JSONL 和内存缓存
+     *
+     * @param sessionKey 会话键
+     * @param summary 压缩摘要
+     * @param firstKeptEntryId 第一个保留的消息 ID
+     * @param totalTokens 压缩后的总 Token 数（header + 摘要）
+     * @return Entry ID
+     */
+    public String appendCompaction(String sessionKey, String summary,
+                                   String firstKeptEntryId, Integer totalTokens) {
+        JsonlSessionStore store = getJsonlStore(sessionKey);
+        String id = store.appendCompaction(summary, firstKeptEntryId, totalTokens);
+
+        // 同时添加到内存缓存
+        Session session = cache.get(sessionKey);
+        if (session != null) {
+            session.touch();
+            SessionEntry entry = SessionEntry.builder()
+                .id(id)  // 使用 JSONL 返回的 ID
+                .type(SessionEntry.EntryType.COMPACTION)
+                .summary(summary)
+                .firstKeptEntryId(firstKeptEntryId)
+                .totalTokens(totalTokens)
+                .timestamp(Instant.now().toString())
+                .build();
+            session.addEntry(entry);
+        }
+
+        return id;
+    }
+
+    /**
+     * 【获取会话的所有 Entry】
+     *
+     * 优先从内存获取，如果内存为空则从 JSONL 加载
+     *
+     * @param sessionKey 会话键
+     * @return Entry 列表
+     */
+    public List<SessionEntry> getAllEntries(String sessionKey) {
+        Session session = cache.get(sessionKey);
+        if (session != null && session.getEntryCount() > 0) {
+            return session.getEntries();
+        }
+
+        // 内存未命中，从 JSONL 加载
+        JsonlSessionStore store = getJsonlStore(sessionKey);
+        return store.readAllEntries();
+    }
+
+    /**
+     * 【重新加载会话 Entry】
+     *
+     * 用于压缩后刷新内存中的 entry
+     *
+     * @param sessionKey 会话键
+     */
+    public void reloadEntries(String sessionKey) {
+        Session session = cache.get(sessionKey);
+        if (session == null) {
+            return;
+        }
+
+        JsonlSessionStore store = getJsonlStore(sessionKey);
+        List<SessionEntry> allEntries = store.readAllEntries();
+        session.setEntries(allEntries);
+        log.info("[SessionManager] 重新加载会话 entry: {} ({} entries)", sessionKey, allEntries.size());
     }
 
 

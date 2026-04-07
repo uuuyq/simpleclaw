@@ -7,6 +7,7 @@ import com.simpleclaw.providers.LLMProvider;
 import com.simpleclaw.session.JsonlSessionStore;
 import com.simpleclaw.session.SessionManager;
 import com.simpleclaw.session.model.Session;
+import com.simpleclaw.session.model.SessionEntry;
 import lombok.extern.slf4j.Slf4j;
 
 import java.lang.ref.WeakReference;
@@ -137,19 +138,19 @@ public class SessionCompactionService {
      * 【处理流程】：
      * 1. 使用 ContextBuilder 构建压缩 Prompt
      * 2. 调用 LLM 生成 5-section 摘要（带质量审核和重试）
-     * 3. 将摘要作为 compaction entry 追加到 JSONL
+     * 3. 将摘要作为 compaction entry 追加到 JSONL 和内存
      *
      * @param messages 要压缩的消息列表（chunk[0,endIdx)）
      * @param firstKeptEntryId 压缩后第一个保留的消息 ID（即 messages[endIdx] 的 ID）
      * @param sessionKey 会话键 (channel:chatId)
-     * @param jsonlStore JSONL 会话存储
+     * @param totalTokens 压缩后的总 Token 数（systemPrompt + 摘要）
      * @return 异步任务，返回是否成功归档
      */
     public CompletableFuture<Boolean> consolidateMessages(
             List<Map<String, Object>> messages,
             String firstKeptEntryId,
             String sessionKey,
-            com.simpleclaw.session.JsonlSessionStore jsonlStore) {
+            int threshold) {
 
         // 【解析 sessionKey 获取 channel 和 chatId】
         String[] parts = sessionKey.split(":", 2);
@@ -164,48 +165,91 @@ public class SessionCompactionService {
             // 【步骤 1】使用 ContextBuilder 构建压缩提示
             List<Map<String, Object>> promptMessages = contextBuilder.buildCompactionContext(messages);
 
-            // 【步骤 3】调用 LLM 生成摘要（带质量审核和重试）
-            String summary = generateCompactionSummaryWithQualityCheck(promptMessages);
+            // 【步骤 2】计算 maxOutputTokens = threshold * factor（用于 prompt 控制）
+            double factor = agentConfig.getCompactionOutputFactor();
+            int maxOutputTokens = (int) (threshold * factor);
 
-            if (summary == null) {
+            // 【步骤 3】调用 LLM 生成摘要（带质量审核和重试）
+            // chat 的 maxTokens 使用 threshold（硬上限），prompt 中使用 maxOutputTokens（软性约束）
+            SummaryResult result = generateCompactionSummaryWithQualityCheck(promptMessages, maxOutputTokens, threshold);
+
+            if (result == null || result.getSummary() == null) {
                 log.error("[Consolidator] Failed to generate compaction summary after retries");
                 return false;
             }
 
-            // 【步骤 4】计算 Token 统计
-            int tokensBefore = estimateMessagesTokens(messages);
-            int tokensAfter = estimateSummaryTokens(summary);
+            // 【步骤 4】计算 totalTokens = completion_tokens + header_tokens
+            // completion_tokens 是 LLM 实际生成的摘要长度
+            // header_tokens 从 PromptsConfig 获取
+            Integer completionTokens = result.getCompletionTokens();
+            if (completionTokens == null || completionTokens <= 0) {
+                // 如果 LLM 没有返回，使用启发式估算
+                throw new RuntimeException("[Consolidator] LLM did not return completion_tokens");
+            }
+            int totalTokens = com.simpleclaw.config.model.PromptsConfig.calculateCompactionTotalTokens(completionTokens);
 
-            // 【步骤 5】追加 compaction entry 到 JSONL
-            jsonlStore.appendCompaction(
-                summary,
-                firstKeptEntryId,
-                tokensBefore,
-                tokensAfter
-            );
+            // 【步骤 5】追加 compaction entry 到 JSONL 和内存
+            sessions.appendCompaction(sessionKey, result.getSummary(), firstKeptEntryId, totalTokens);
 
-            log.info("[Consolidator] Successfully compacted session {}: {} -> {} tokens, firstKeptId={}",
-                    sessionKey, tokensBefore, tokensAfter, firstKeptEntryId);
+            log.info("[Consolidator] Successfully compacted session {}: completionTokens={}, totalTokens={}, firstKeptId={}",
+                    sessionKey, completionTokens, totalTokens, firstKeptEntryId);
 
             return true;
         });
     }
-    
+
+    /**
+     * 【摘要生成结果】
+     */
+    private static class SummaryResult {
+        private final String summary;
+        private final Integer completionTokens;  // 模型生成的摘要 tokens
+
+        public SummaryResult(String summary, Integer completionTokens) {
+            this.summary = summary;
+            this.completionTokens = completionTokens;
+        }
+
+        public String getSummary() {
+            return summary;
+        }
+
+        public Integer getCompletionTokens() {
+            return completionTokens;
+        }
+    }
+
     /**
      * 【带质量审核的摘要生成】
      *
      * @param promptMessages 构建好的 Prompt 消息列表
-     * @return 生成的摘要，失败返回 null
+     * @param targetTokens 目标输出 tokens（用于 prompt 中的软性约束）
+     * @param maxTokens 最大输出 tokens（传给 LLM 的硬上限）
+     * @return 生成的摘要和 Token 使用情况，失败返回 null
      */
-    private String generateCompactionSummaryWithQualityCheck(
-            List<Map<String, Object>> promptMessages) {
+    private SummaryResult generateCompactionSummaryWithQualityCheck(
+            List<Map<String, Object>> promptMessages,
+            int targetTokens,
+            int maxTokens) {
 
         int maxRetries = agentConfig.getQualityGuardMaxRetries();
         String feedback = null;
+        Integer lastCompletionTokens = null;
 
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
             // 复制消息列表，避免修改原始列表
             List<Map<String, Object>> chatMessages = new ArrayList<>(promptMessages);
+
+            // 【添加长度约束到 Prompt】
+            // 在第一条 system message 后添加长度约束
+            if (!chatMessages.isEmpty() && "system".equals(chatMessages.get(0).get("role"))) {
+                String originalContent = (String) chatMessages.get(0).get("content");
+                String constrainedContent = originalContent + String.format(
+                    "\n\n【长度约束】请确保生成的摘要简洁，控制在约 %d tokens 以内。",
+                    targetTokens
+                );
+                chatMessages.set(0, Map.of("role", "system", "content", constrainedContent));
+            }
 
             // 如果有反馈，附加到最后一条 user prompt
             if (feedback != null) {
@@ -217,10 +261,15 @@ public class SessionCompactionService {
                 chatMessages.add(Map.of("role", "user", "content", feedbackPrompt));
             }
 
-            // 调用 LLM
+            // 调用 LLM，maxTokens 使用 threshold（硬上限）
             com.simpleclaw.providers.LLMResponse response = provider.chat(
-                chatMessages, null, model, 2048, 0.3, null
+                chatMessages, null, model, maxTokens, 0.3, null
             );
+
+            // 记录 completion_tokens（模型生成的摘要长度）
+            if (response.getCompletionTokens() > 0) {
+                lastCompletionTokens = response.getCompletionTokens();
+            }
 
             String summary = response.getContent();
             if (summary == null || summary.isEmpty()) {
@@ -231,7 +280,7 @@ public class SessionCompactionService {
             // 质量审核
             QualityCheckResult check = auditSummaryQuality(summary);
             if (check.isValid()) {
-                return summary;
+                return new SummaryResult(summary, lastCompletionTokens);
             }
 
             // 准备反馈用于重试
@@ -325,7 +374,69 @@ public class SessionCompactionService {
         Object id = msg.get("id");
         return id != null ? id.toString() : null;
     }
-    
+
+    /**
+     * 【获取 Entry 列表中指定索引的 Entry ID】
+     *
+     * 跳过非 MESSAGE 类型的 entry，找到第 messageIndex 个消息 entry
+     *
+     * @param entries Entry 列表
+     * @param messageIndex 消息索引（只计数 MESSAGE 类型）
+     * @return Entry ID，如果找不到则返回 null
+     */
+    private String getEntryIdAtIndex(List<SessionEntry> entries, int messageIndex) {
+        int msgCount = 0;
+        for (SessionEntry entry : entries) {
+            if (entry.isMessage()) {
+                if (msgCount == messageIndex) {
+                    return entry.getId();
+                }
+                msgCount++;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 【估算 Entry 列表的 Token 数】
+     *
+     * 只计算最后一个 compaction 之后的 MESSAGE 类型 entry
+     */
+    private int estimateEntriesTokens(List<SessionEntry> entries) {
+        // 找到最后一个 compaction
+        SessionEntry lastCompaction = null;
+        for (int i = entries.size() - 1; i >= 0; i--) {
+            if (entries.get(i).isCompaction()) {
+                lastCompaction = entries.get(i);
+                break;
+            }
+        }
+
+        int total = 0;
+        boolean found = false;
+
+        for (SessionEntry entry : entries) {
+            // 如果有 compaction，从 firstKeptEntryId 开始计算
+            if (lastCompaction != null) {
+                if (entry.getId().equals(lastCompaction.getFirstKeptEntryId())) {
+                    found = true;
+                }
+                if (found && entry.isMessage()) {
+                    String content = entry.getContent() != null ? entry.getContent() : "";
+                    total += compactionChecker.estimatePromptTokens(content);
+                }
+            } else {
+                // 没有 compaction，计算所有 message
+                if (entry.isMessage()) {
+                    String content = entry.getContent() != null ? entry.getContent() : "";
+                    total += compactionChecker.estimatePromptTokens(content);
+                }
+            }
+        }
+
+        return total;
+    }
+
     // ==================== 子服务访问 ====================
 
     /**
@@ -426,12 +537,20 @@ public class SessionCompactionService {
             // 【标记为压缩中】
             compactingSessions.put(sessionKey, true);
 
-            // 【从 JSONL 重新构建消息列表】使用 ContextBuilder 统一构建
-            List<Map<String, Object>> messages = contextBuilder.getMessagesForTokenEstimation(jsonlStore);
+            // 【从 SessionManager 获取原始 entries】用于压缩决策
+            List<SessionEntry> allEntries = sessions.getAllEntries(sessionKey);
 
-            if (messages.isEmpty()) {
+            if (allEntries.isEmpty()) {
                 log.debug("[Consolidator] 没有需要压缩的消息: {}", sessionKey);
                 return;
+            }
+
+            // 【构建消息列表用于 Token 估算】只包含 MESSAGE 类型
+            List<Map<String, Object>> messages = new ArrayList<>();
+            for (SessionEntry entry : allEntries) {
+                if (entry.isMessage()) {
+                    messages.add(entry.toMessageMap());
+                }
             }
 
             // 【Token 估算】使用启发式估算当前消息列表
@@ -450,8 +569,11 @@ public class SessionCompactionService {
                 return;
             }
 
+            log.info("[Consolidator] 开始执行会话压缩: session={}, tokens={} >= safeBudget={}",
+                    sessionKey, estimatedTokens, safeBudget);
+
             // 【步骤 3】执行多轮压缩
-            executeCompactionRounds(session, jsonlStore, messages, estimatedTokens, target);
+            executeCompactionRounds(session, jsonlStore, allEntries, estimatedTokens, target);
 
         } finally {
             // 【清除压缩标志】
@@ -467,32 +589,34 @@ public class SessionCompactionService {
      * 循环执行压缩直到 Token 数降至目标以下，或达到最大轮次。
      *
      * 【每轮处理】：
-     * 1. 选择压缩边界（pickConsolidationBoundary）
-     *    - 寻找用户消息边界，确保切割位置合理
-     *    - 返回 endIdx，表示压缩 chunk[0,endIdx)，保留从 endIdx 开始
-     * 2. 获取 firstKeptEntryId = messages[endIdx] 的 ID
-     * 3. 调用 consolidateMessages 生成摘要并写入 JSONL
-     * 4. 重新从 JSONL 读取消息列表（自动应用压缩）
-     * 5. 重新估算 Token 数
-     *
-     * 【注意】：
-     * - 每轮压缩后重新读取消息列表，确保状态同步
-     * - 使用 firstKeptEntryId 标记保留消息的起始位置
+     * 1. 从 allEntries 构建消息列表（排除之前的 compaction）
+     * 2. 选择压缩边界（pickConsolidationBoundary）
+     * 3. 获取 firstKeptEntryId = entries[endIdx] 的 ID
+     * 4. 调用 consolidateMessages 生成摘要并写入 JSONL
+     * 5. 重新加载 entries，继续下一轮
      *
      * @param session 当前会话
      * @param jsonlStore JSONL 会话存储
-     * @param messages 当前消息列表（已排除之前压缩的部分）
+     * @param allEntries 当前所有 entries（会被更新）
      * @param initialTokens 初始 Token 数
      * @param target 目标 Token 数
      */
     private void executeCompactionRounds(Session session, JsonlSessionStore jsonlStore,
-                                         List<Map<String, Object>> messages,
+                                         List<SessionEntry> allEntries,
                                          int initialTokens, int target) {
         String sessionKey = session.getKey();
         int estimatedTokens = initialTokens;
         int maxRounds = agentConfig.getMaxConsolidationRounds();
 
         for (int roundNum = 0; roundNum < maxRounds; roundNum++) {
+            // 从 entries 构建消息列表（只包含 MESSAGE 类型）
+            List<Map<String, Object>> messages = new ArrayList<>();
+            for (SessionEntry entry : allEntries) {
+                if (entry.isMessage()) {
+                    messages.add(entry.toMessageMap());
+                }
+            }
+
             // 如果已达到目标，停止压缩
             if (estimatedTokens <= target) {
                 log.info("[Consolidator] 已达到压缩目标: {} <= {}", estimatedTokens, target);
@@ -522,10 +646,11 @@ public class SessionCompactionService {
             log.info("[Consolidator] 压缩轮次 {}: session={}, tokens={}/{}, chunk={} msgs",
                     roundNum, sessionKey, estimatedTokens, contextWindowTokens, chunk.size());
 
-            // 【步骤 6】执行 Safeguard 压缩
-            // 【关键】firstKeptEntryId 是边界后第一个保留的消息的 ID
-            String firstKeptEntryId = getMessageIdAtIndex(messages, endIdx);
-            CompletableFuture<Boolean> result = consolidateMessages(chunk, firstKeptEntryId, sessionKey, jsonlStore);
+            // 【关键】获取边界后第一个保留的 entry 的 ID（从原始 entries 中）
+            String firstKeptEntryId = getEntryIdAtIndex(allEntries, endIdx);
+            // 计算 threshold（用于控制摘要输出长度）
+            int threshold = compactionChecker.calculateThreshold(contextWindowTokens);
+            CompletableFuture<Boolean> result = consolidateMessages(chunk, firstKeptEntryId, sessionKey, threshold);
             if (!result.join()) {
                 log.error("[Consolidator] 压缩失败: {}", sessionKey);
                 return;
@@ -534,12 +659,12 @@ public class SessionCompactionService {
             // 更新会话
             sessions.save(session);
 
-            // 【关键】重新从 JSONL 构建消息列表（使用 ContextBuilder）
-            // 这样会自动排除已压缩的消息，无需手动操作内存列表
-            messages = contextBuilder.getMessagesForTokenEstimation(jsonlStore);
+            // 【关键】重新加载 entries（包含新添加的 compaction）
+            sessions.reloadEntries(sessionKey);
+            allEntries = sessions.getAllEntries(sessionKey);
 
             // 重新估算 Token 数
-            estimatedTokens = compactionChecker.estimateMessagesTokens(messages);
+            estimatedTokens = estimateEntriesTokens(allEntries);
 
             log.info("[Consolidator] 压缩完成: session={}, newTokens={}", sessionKey, estimatedTokens);
         }

@@ -61,7 +61,7 @@ public class ExecTool extends BaseTool {
         String command = (String) c;
         int timeout = execConfig.getTimeoutSeconds() > 0 ? execConfig.getTimeoutSeconds() : 60;
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"/bin/sh", "-c", command});
+            Process p = startProcess(command);
             Future<String> outFuture = executor.submit(new StreamReader(p.getInputStream()));
             Future<String> errFuture = executor.submit(new StreamReader(p.getErrorStream()));
             boolean finished = p.waitFor(timeout, TimeUnit.SECONDS);
@@ -77,6 +77,21 @@ public class ExecTool extends BaseTool {
             return out != null ? out : "";
         } catch (Exception e) {
             return "[Error: " + e.getMessage() + "]";
+        }
+    }
+
+    /**
+     * 【根据操作系统启动进程】
+     * Windows 使用 cmd.exe，Unix/Linux/macOS 使用 /bin/sh
+     */
+    private Process startProcess(String command) throws Exception {
+        String os = System.getProperty("os.name").toLowerCase();
+        if (os.contains("win")) {
+            // Windows: 使用 cmd.exe
+            return Runtime.getRuntime().exec(new String[]{"cmd.exe", "/c", command});
+        } else {
+            // Unix/Linux/macOS: 使用 /bin/sh
+            return Runtime.getRuntime().exec(new String[]{"/bin/sh", "-c", command});
         }
     }
 

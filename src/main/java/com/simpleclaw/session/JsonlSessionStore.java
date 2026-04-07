@@ -51,10 +51,19 @@ public class JsonlSessionStore {
     }
     
     /**
+     * 【检查会话文件是否存在】
+     *
+     * @return 如果文件存在返回 true
+     */
+    public boolean exists() {
+        return Files.exists(sessionFile);
+    }
+
+    /**
      * 【追加 Entry 到 JSONL 文件】
-     * 
+     *
      * 使用原子追加操作，确保并发安全。
-     * 
+     *
      * @param entry 要追加的 Entry
      */
     public void appendEntry(SessionEntry entry) {
@@ -79,9 +88,16 @@ public class JsonlSessionStore {
     
     /**
      * 【追加消息 Entry】
-     * 
+     *
      * 便捷方法，用于追加对话消息。
-     * 
+     *
+     * @param role 角色（user/assistant/system）
+     * @param content 内容
+     * @return 创建的 Entry ID
+     */
+    /**
+     * 【追加消息 Entry】
+     *
      * @param role 角色（user/assistant/system）
      * @param content 内容
      * @return 创建的 Entry ID
@@ -93,39 +109,57 @@ public class JsonlSessionStore {
             .content(content)
             .timestamp(Instant.now().toString())
             .build();
-        
+
+        appendEntry(entry);
+        return entry.getId();
+    }
+
+    /**
+     * 【追加消息 Entry（带 totalTokens）】
+     *
+     * @param role 角色（user/assistant/system）
+     * @param content 内容
+     * @param totalTokens 累计的总 Token 数
+     * @return 创建的 Entry ID
+     */
+    public String appendMessage(String role, String content, Integer totalTokens) {
+        SessionEntry entry = SessionEntry.builder()
+            .type(SessionEntry.EntryType.MESSAGE)
+            .role(role)
+            .content(content)
+            .totalTokens(totalTokens)
+            .timestamp(Instant.now().toString())
+            .build();
+
         appendEntry(entry);
         return entry.getId();
     }
     
     /**
      * 【追加压缩标记 Entry】
-     * 
+     *
      * @param summary 压缩摘要（5-section 结构化）
      * @param firstKeptEntryId 第一个保留的消息 ID
-     * @param tokensBefore 压缩前 Token 数
-     * @param tokensAfter 压缩后 Token 数
+     * @param totalTokens 压缩后的总 Token 数（header + 摘要）
      * @return 创建的 Entry ID
      */
     public String appendCompaction(
             String summary,
             String firstKeptEntryId,
-            int tokensBefore,
-            int tokensAfter) {
-        
+            Integer totalTokens) {
+
         SessionEntry entry = SessionEntry.builder()
             .type(SessionEntry.EntryType.COMPACTION)
             .summary(summary)
             .firstKeptEntryId(firstKeptEntryId)
-            .tokensBefore(tokensBefore)
-            .tokensAfter(tokensAfter)
+            .totalTokens(totalTokens)
             .timestamp(Instant.now().toString())
             .build();
-        
+
         appendEntry(entry);
-        log.info("[JsonlSession] Appended compaction: id={}, tokens {}->{}", 
-                 entry.getId(), tokensBefore, tokensAfter);
-        
+        log.info("[JsonlSession] Appended compaction: id={}, totalTokens={}",
+                 entry.getId(), totalTokens);
+
         return entry.getId();
     }
     
@@ -180,154 +214,4 @@ public class JsonlSessionStore {
         return null;
     }
 
-    /**
-     * 【查找最后一个压缩标记】
-     *
-     * @return 最后一个 compaction entry，如果没有则返回 null
-     */
-    public SessionEntry findLastCompaction() {
-        List<SessionEntry> entries = readAllEntries();
-
-        for (int i = entries.size() - 1; i >= 0; i--) {
-            if (entries.get(i).isCompaction()) {
-                return entries.get(i);
-            }
-        }
-
-        return null;
-    }
-    
-    /**
-     * 【构建会话上下文】
-     *
-     * 根据最后一个有效的 compaction entry 构建发送给 LLM 的消息列表：
-     * 1. 查找最后一个有效的 compaction（firstKeptEntryId 指向存在的消息）
-     * 2. 如果有有效 compaction，注入摘要 + 从 firstKeptEntryId 开始的消息
-     * 3. 如果没有有效 compaction，返回所有消息
-     *
-     * @return LLM 消息列表
-     */
-    public List<Map<String, Object>> buildContext() {
-        List<SessionEntry> allEntries = readAllEntries();
-
-        if (allEntries.isEmpty()) {
-            return Collections.emptyList();
-        }
-
-        // 【查找最后一个有效的 compaction】
-        // 从后向前扫描，找到第一个有效的 compaction
-        // 有效的条件：firstKeptEntryId 为 null（全部压缩）或指向存在的消息
-        SessionEntry validCompaction = null;
-        for (int i = allEntries.size() - 1; i >= 0; i--) {
-            SessionEntry entry = allEntries.get(i);
-            if (entry.isCompaction()) {
-                String firstKeptId = entry.getFirstKeptEntryId();
-                // firstKeptEntryId 为 null 表示全部压缩，也是有效的
-                // 不为 null 时需要检查是否存在
-                if (firstKeptId == null) {
-                    validCompaction = entry;
-                    break;
-                }
-                boolean idExists = allEntries.stream()
-                        .anyMatch(e -> e.getId().equals(firstKeptId));
-                if (idExists) {
-                    validCompaction = entry;
-                    break;
-                } else {
-                    log.debug("[JsonlSession] Skipping invalid compaction: id={}, firstKeptEntryId={} not found",
-                            entry.getId(), firstKeptId);
-                }
-            }
-        }
-
-        List<Map<String, Object>> messages = new ArrayList<>();
-
-        if (validCompaction != null) {
-            // 【注入压缩摘要】
-            Map<String, Object> summaryMsg = new HashMap<>();
-            summaryMsg.put("role", "system");
-            summaryMsg.put("content", "[Previous Session Summary]\n\n" + validCompaction.getSummary());
-            messages.add(summaryMsg);
-
-            // 【从 firstKeptEntryId 开始读取消息】
-            String firstKeptId = validCompaction.getFirstKeptEntryId();
-
-            // firstKeptEntryId 为 null 表示全部压缩，只返回摘要
-            if (firstKeptId != null) {
-                boolean found = false;
-                for (SessionEntry entry : allEntries) {
-                    if (entry.getId().equals(firstKeptId)) {
-                        found = true;
-                    }
-                    if (found && entry.isMessage()) {
-                        messages.add(entry.toMessageMap());
-                    }
-                }
-            }
-
-            log.info("[JsonlSession] Built context from compaction: id={}, firstKeptEntryId={}, messages={}",
-                    validCompaction.getId(), firstKeptId, messages.size() - 1); // -1 因为第一条是摘要
-
-        } else {
-            // 【没有有效 compaction，返回所有消息】
-            for (SessionEntry entry : allEntries) {
-                if (entry.isMessage()) {
-                    messages.add(entry.toMessageMap());
-                }
-            }
-
-            log.info("[JsonlSession] Built context with all messages: count={}", messages.size());
-        }
-
-        return messages;
-    }
-    
-    /**
-     * 【获取所有消息 Entries】
-     * 
-     * @return 所有 MESSAGE 类型的 Entry
-     */
-    public List<SessionEntry> getAllMessages() {
-        return readAllEntries().stream()
-            .filter(SessionEntry::isMessage)
-            .toList();
-    }
-    
-    /**
-     * 【统计 Token 使用量】
-     * 
-     * @return 总 Token 数
-     */
-    public int getTotalTokens() {
-        return readAllEntries().stream()
-            .filter(e -> e.getUsage() != null)
-            .mapToInt(e -> e.getUsage().getTotalTokens())
-            .sum();
-    }
-    
-    /**
-     * 【获取文件大小（字节）】
-     */
-    public long getFileSize() {
-        try {
-            return Files.size(sessionFile);
-        } catch (IOException e) {
-            log.warn("[JsonlSession] Failed to get file size: {}", e.getMessage());
-            return 0;
-        }
-    }
-    
-    /**
-     * 【检查文件是否存在】
-     */
-    public boolean exists() {
-        return Files.exists(sessionFile);
-    }
-    
-    /**
-     * 【获取会话文件路径】
-     */
-    public Path getSessionFile() {
-        return sessionFile;
-    }
 }

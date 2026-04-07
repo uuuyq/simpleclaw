@@ -32,4 +32,10 @@ public class ContextBudgetConfig {
 
     public int getSoftThresholdTokens() { return softThresholdTokens; }
     public void setSoftThresholdTokens(int softThresholdTokens) { this.softThresholdTokens = softThresholdTokens; }
+
+    // 压缩输出因子：控制摘要最大长度 = threshold * factor
+    private double compactionOutputFactor = 0.5;
+
+    public double getCompactionOutputFactor() { return compactionOutputFactor; }
+    public void setCompactionOutputFactor(double compactionOutputFactor) { this.compactionOutputFactor = compactionOutputFactor; }
 }

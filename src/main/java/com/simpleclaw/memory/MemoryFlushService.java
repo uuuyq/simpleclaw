@@ -5,7 +5,7 @@ import com.simpleclaw.config.model.AgentConfig;
 import com.simpleclaw.config.model.PromptsConfig;
 import com.simpleclaw.providers.LLMProvider;
 import com.simpleclaw.providers.LLMResponse;
-import com.simpleclaw.session.JsonlSessionStore;
+import com.simpleclaw.session.SessionManager;
 import com.simpleclaw.session.model.Session;
 import lombok.extern.slf4j.Slf4j;
 
@@ -39,6 +39,7 @@ import java.util.Map;
  * 1. 构建包含上次压缩摘要 + 最近会话历史的 Prompt
  * 2. 调用 LLM 生成要保存的记忆内容
  * 3. 将内容追加写入 memory/YYYY-MM-DD.md 文件
+ * 4. 触发向量化索引（通过 MemoryIndexService）
  */
 @Slf4j
 public class MemoryFlushService {
@@ -56,6 +57,7 @@ public class MemoryFlushService {
     private final String model;
     private final AgentConfig agentConfig;
     private final ContextBuilder contextBuilder;
+    private final MemoryIndexService indexService;
 
     /**
      * 【构造函数】
@@ -65,18 +67,21 @@ public class MemoryFlushService {
      * @param model 模型名称
      * @param agentConfig Agent 配置
      * @param contextBuilder 上下文构建器
+     * @param indexService 记忆索引服务（可选，用于向量化）
      */
     public MemoryFlushService(
             Path workspace,
             LLMProvider provider,
             String model,
             AgentConfig agentConfig,
-            ContextBuilder contextBuilder) {
+            ContextBuilder contextBuilder,
+            MemoryIndexService indexService) {
         this.workspace = workspace;
         this.provider = provider;
         this.model = model;
         this.agentConfig = agentConfig;
         this.contextBuilder = contextBuilder;
+        this.indexService = indexService;
     }
 
     // ========== 主入口 ==========
@@ -94,16 +99,17 @@ public class MemoryFlushService {
      * 5. 追加写入 memory/YYYY-MM-DD.md
      *
      * @param session 当前会话
-     * @param jsonlStore JSONL 会话存储
+     * @param sessionManager 会话管理器
      * @return 是否成功
      */
-    public boolean flushMemory(Session session, JsonlSessionStore jsonlStore) {
+    public boolean flushMemory(Session session, SessionManager sessionManager) {
         try {
             // 【步骤 1】获取当前日期戳
             String dateStamp = getCurrentDateStamp();
 
             // 【步骤 2】使用 ContextBuilder 构建记忆提取上下文
-            List<Map<String, Object>> messages = contextBuilder.buildMemoryFlushContext(jsonlStore, dateStamp);
+            List<Map<String, Object>> messages = contextBuilder.buildMemoryFlushContext(
+                    sessionManager, session.getKey(), dateStamp);
 
             // 【步骤 3】调用 LLM 生成记忆内容
             String memoryContent = generateMemoryContent(messages);
@@ -124,6 +130,13 @@ public class MemoryFlushService {
             appendToMemoryFile(memoryFile, memoryContent, session.getKey());
 
             log.info("[MemoryFlush] 成功保存记忆到: {}", memoryFile);
+
+            // 【步骤 6】触发向量化索引（如果索引服务可用）
+            if (indexService != null) {
+                indexService.indexFile(memoryFile);
+                log.debug("[MemoryFlush] 记忆文件已索引: {}", memoryFile);
+            }
+
             return true;
 
         } catch (Exception e) {

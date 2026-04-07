@@ -15,6 +15,8 @@ public class AgentsConfig {
     private String model;
     /** 单次回复最大 token 数 */
     private int maxTokens = 4096;
+    /** 模型上下文窗口大小（用于 Token 估算和压缩判断） */
+    private int contextWindow = 128000;
     /** 采样温度 */
     private double temperature = 0.7;
     /** 单轮最大工具调用迭代次数 */
@@ -56,6 +58,14 @@ public class AgentsConfig {
 
     public void setMaxTokens(int maxTokens) {
         this.maxTokens = maxTokens;
+    }
+
+    public int getContextWindow() {
+        return contextWindow;
+    }
+
+    public void setContextWindow(int contextWindow) {
+        this.contextWindow = contextWindow;
     }
 
     public double getTemperature() {

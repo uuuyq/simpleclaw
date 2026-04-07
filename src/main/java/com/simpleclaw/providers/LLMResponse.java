@@ -51,6 +51,30 @@ public class LLMResponse {
         this.usage = usage;
     }
 
+    /**
+     * 【获取 prompt tokens】
+     * @return prompt_tokens，如果没有则返回 0
+     */
+    public int getPromptTokens() {
+        return usage != null && usage.containsKey("prompt_tokens") ? usage.get("prompt_tokens") : 0;
+    }
+
+    /**
+     * 【获取 completion tokens】
+     * @return completion_tokens，如果没有则返回 0
+     */
+    public int getCompletionTokens() {
+        return usage != null && usage.containsKey("completion_tokens") ? usage.get("completion_tokens") : 0;
+    }
+
+    /**
+     * 【获取 total tokens】
+     * @return total_tokens，如果没有则返回 0
+     */
+    public int getTotalTokens() {
+        return usage != null && usage.containsKey("total_tokens") ? usage.get("total_tokens") : 0;
+    }
+
     public String getReasoningContent() {
         return reasoningContent;
     }

@@ -1,7 +1,6 @@
 package com.simpleclaw.agent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.simpleclaw.agent.skills.SkillsLoader;
 import com.simpleclaw.agent.tools.fs.*;
 import com.simpleclaw.agent.tools.system.*;
 import com.simpleclaw.agent.tools.communication.*;
@@ -17,10 +16,12 @@ import com.simpleclaw.cron.WheelCronService;
 import com.simpleclaw.memory.MemoryManager;
 
 import com.simpleclaw.providers.LLMProvider;
+import com.simpleclaw.providers.LLMResponse;
 import com.simpleclaw.providers.ToolCallRequest;
 import com.simpleclaw.agent.model.RunResult;
 import com.simpleclaw.session.SessionManager;
 import com.simpleclaw.session.model.Session;
+import com.simpleclaw.session.model.SessionEntry;
 import lombok.extern.slf4j.Slf4j;
 
 import java.nio.file.Path;
@@ -64,7 +65,6 @@ public class AgentLoop {
     private final SessionManager sessionManager;
     private final ToolRegistry toolRegistry;
     private final ContextBuilder contextBuilder;
-    private final SkillsLoader skillsLoader;
     private final int maxCompletionTokens = 1024;  // 默认最大完成 tokens
 
     /** 【记忆管理器】统一管理层：会话压缩 + Memory Flush + 记忆检索 */
@@ -133,14 +133,7 @@ public class AgentLoop {
         this.mcpServers = agentConfig.getMcpServers() != null
             ? agentConfig.getMcpServers()
             : Collections.emptyMap();
-        // 【初始化 SkillsLoader】使用新的多源扫描技能加载器
-        this.skillsLoader = new SkillsLoader(
-                this.workspace,
-                null, // dataDir 可从 config 获取
-                null, // builtinSkillsDir
-                agentConfig.getSkillsConfig()
-        );
-        // 【初始化 ContextBuilder】使用新的构造函数
+        // 【初始化 ContextBuilder】使用新的构造函数（内部包含 SkillsLoader）
         this.contextBuilder = new ContextBuilder(
                 this.workspace,
                 null, // dataDir
@@ -260,39 +253,45 @@ public class AgentLoop {
         synchronized (lock) {
             Session session = sessionManager.getOrCreate(sessionKey);
             
-            // 【获取 JSONL Store】
-            com.simpleclaw.session.JsonlSessionStore jsonlStore = sessionManager.getJsonlStore(sessionKey);
-
             // 1. 处理特殊命令
             if (handleSpecialCommands(session, content.trim(), msg)) {
                 return null; // 特殊命令已处理，无需继续
             }
 
-            // 2. 【检查并执行会话压缩】MemoryManager 统一管理（内部已记录上下文窗口使用情况）
-            memoryManager.checkAndCompact(session, jsonlStore, content);
-
-            // 3. 准备上下文（使用 ContextBuilder 统一构建）
+            // 2. 准备上下文（使用 ContextBuilder 统一构建）
             Map<String, Object> requestContext = buildRequestContext(msg);
-            List<String> skillNames = skillsLoader.getAlwaysSkills();
             List<Map<String, Object>> initialMessages = contextBuilder.buildChatContext(
-                    jsonlStore, content, skillNames);
+                    sessionManager, sessionKey, content, null);
 
-            // 5. 运行引擎
+            // 3. 【会话压缩检查】在运行前检查是否需要压缩
+            if (memoryManager != null && memoryManager.isEnabled()) {
+                // 检查并执行压缩
+                memoryManager.checkAndCompact(session, initialMessages, sessionManager, content);
+            }
+
+            // 4. 运行引擎
             RunResult result = runAgentLoop(initialMessages, streamConsumer, requestContext);
 
-            // 6. 【追加消息到 JSONL】
+            // 5. 【追加消息到 JSONL】
             sessionManager.appendMessage(sessionKey, "user", content);
             if (result.getContent() != null) {
-                sessionManager.appendMessage(sessionKey, "assistant", result.getContent());
+                // 计算 totalTokens = firstPromptTokens + lastCompletionTokens
+                Integer totalTokens = result.getTotalPromptTokens();
+                sessionManager.appendMessage(sessionKey, "assistant", result.getContent(), totalTokens);
             }
+
+//            // 6. 【会话压缩检查】在回复后异步检查（后台压缩）
+//            if (memoryManager != null && memoryManager.isEnabled()) {
+//                Session finalSession = session;
+//                CompletableFuture.runAsync(() -> {
+//                    List<Map<String, Object>> finalMessages = contextBuilder.getMessagesForTokenEstimation(
+//                            sessionManager, sessionKey);
+//                    memoryManager.checkAndCompact(finalSession, finalMessages, sessionManager, "");
+//                });
+//            }
 
             // 7. 更新会话访问时间
             sessionManager.save(session);
-
-            // 8. 【后台检查】在对话结束后，再次检查是否需要压缩
-            scheduleBackground(() -> {
-                memoryManager.checkAndCompact(session, jsonlStore, "");
-            });
 
             OutboundMessage out = new OutboundMessage(msg.getChannel(), msg.getChatId(), result.getContent());
             out.setMetadata(msg.getMetadata() != null ? msg.getMetadata() : Collections.emptyMap());
@@ -355,11 +354,27 @@ public class AgentLoop {
         List<String> toolsUsed = new ArrayList<>();
         int iter = 0;
 
+        // 【Token 记录】第一次 chat 的 prompt_tokens，最后一次 chat 的 completion_tokens
+        Integer firstPromptTokens = null;
+        Integer lastCompletionTokens = null;
+
         while (iter < maxIterations) {
             iter++;
             log.info("[Agent] === 迭代 {} ===", iter);
-            com.simpleclaw.providers.LLMResponse response = provider.chat(
+            LLMResponse response = provider.chat(
                     messages, toolRegistry.getDefinitions(), model, maxTokens, temperature, streamConsumer);
+
+            // 【记录 Token】第一次迭代记录 prompt_tokens，每次迭代更新 completion_tokens
+            if (response.getPromptTokens() > 0) {
+                if (firstPromptTokens == null) {
+                    firstPromptTokens = response.getPromptTokens();
+                    log.debug("[Agent] 记录第一次 prompt_tokens: {}", firstPromptTokens);
+                }
+            }
+            if (response.getCompletionTokens() > 0) {
+                lastCompletionTokens = response.getCompletionTokens();
+                log.debug("[Agent] 更新 completion_tokens: {}", lastCompletionTokens);
+            }
 
             // 【详细日志】记录 LLM 响应的所有字段
             if (response.getReasoningContent() != null && !response.getReasoningContent().isEmpty()) {
@@ -370,13 +385,13 @@ public class AgentLoop {
             } else {
                 log.warn("[Agent] 回复内容为空");
             }
-            
+
             if (response.hasToolCalls()) {
                 log.info("[Agent] 检测到 {} 个工具调用", response.getToolCalls().size());
             } else {
                 log.info("[Agent] 无工具调用");
             }
-            
+
             log.info("[Agent] Finish Reason: {}", response.getFinishReason());
 
             if (response.hasToolCalls()) {
@@ -390,11 +405,13 @@ public class AgentLoop {
                     return new RunResult("[Error: LLM returned empty response]", toolsUsed);
                 }
                 log.info("[Agent] === 完成，迭代次数: {} ===", iter);
-                return new RunResult(response.getContent() != null ? response.getContent() : "", toolsUsed);
+                return new RunResult(response.getContent() != null ? response.getContent() : "",
+                        toolsUsed, firstPromptTokens, lastCompletionTokens);
             }
         }
         log.warn("[Agent] === 达到最大迭代次数 {} ===", maxIterations);
-        return new RunResult("[Max tool iterations reached]", toolsUsed);
+        return new RunResult("[Max tool iterations reached]", toolsUsed,
+                firstPromptTokens, lastCompletionTokens);
     }
 
     public RunResult runAgentLoop(List<Map<String, Object>> initialMessages) {

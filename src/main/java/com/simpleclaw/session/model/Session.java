@@ -1,21 +1,27 @@
 package com.simpleclaw.session.model;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 
 /**
  * 【会话】
  *
- * 轻量级会话对象，只保留会话标识和元数据。
- * 消息数据存储在 JSONL 文件中，不保存在内存中。
+ * 会话对象，保存会话标识、元数据和内存中的 entry 列表。
+ * Entry 列表有内存大小限制，超出时自动丢弃最前面的 entry。
+ * JSONL 文件仍作为持久化存储。
  *
  * 【设计原则】：
- * - JSONL 文件是真相源，Session 对象只是引用
- * - 消息通过 SessionManager 操作，自动同步到 JSONL
- * - 读取消息时从 JsonlSessionStore 实时构建
+ * - 内存中缓存最近的所有 entry，避免频繁磁盘 I/O
+ * - JSONL 文件作为持久化备份
+ * - 读取 entry 优先从内存获取
  */
 public class Session {
+
+    /** 默认内存中最大 entry 数量 */
+    private static final int DEFAULT_MAX_ENTRIES_IN_MEMORY = 1000;
 
     /** 会话唯一标识，格式通常为 "{channel}:{chatId}" */
     private String key;
@@ -29,10 +35,18 @@ public class Session {
     /** 会话元数据，可存储渠道特定信息 */
     private Map<String, Object> metadata;
 
+    /** 内存中的 entry 列表（按时间顺序） */
+    private final List<SessionEntry> entries;
+
+    /** 内存中最大 entry 数量 */
+    private final int maxEntriesInMemory;
+
     /**
      * 默认构造函数，用于反序列化
      */
     public Session() {
+        this.entries = new ArrayList<>();
+        this.maxEntriesInMemory = DEFAULT_MAX_ENTRIES_IN_MEMORY;
     }
 
     /**
@@ -44,6 +58,22 @@ public class Session {
         this.createdAt = Instant.now();
         this.updatedAt = Instant.now();
         this.metadata = Collections.emptyMap();
+        this.entries = new ArrayList<>();
+        this.maxEntriesInMemory = DEFAULT_MAX_ENTRIES_IN_MEMORY;
+    }
+
+    /**
+     * 创建新会话（指定内存限制）
+     * @param key 会话唯一标识
+     * @param maxEntriesInMemory 内存中最大 entry 数量
+     */
+    public Session(String key, int maxEntriesInMemory) {
+        this.key = key;
+        this.createdAt = Instant.now();
+        this.updatedAt = Instant.now();
+        this.metadata = Collections.emptyMap();
+        this.entries = new ArrayList<>();
+        this.maxEntriesInMemory = maxEntriesInMemory;
     }
 
     /**
@@ -51,6 +81,53 @@ public class Session {
      */
     public void touch() {
         this.updatedAt = Instant.now();
+    }
+
+    /**
+     * 【添加 Entry 到内存】
+     * 如果超出内存限制，丢弃最前面的 entry
+     */
+    public void addEntry(SessionEntry entry) {
+        entries.add(entry);
+        // 如果超出限制，丢弃最前面的 entry
+        while (entries.size() > maxEntriesInMemory) {
+            entries.remove(0);
+        }
+    }
+
+    /**
+     * 【获取所有 Entry（内存中）】
+     */
+    public List<SessionEntry> getEntries() {
+        return new ArrayList<>(entries);
+    }
+
+    /**
+     * 【获取 Entry 数量】
+     */
+    public int getEntryCount() {
+        return entries.size();
+    }
+
+    /**
+     * 【清空内存中的 Entry】
+     * 用于压缩后重新加载
+     */
+    public void clearEntries() {
+        entries.clear();
+    }
+
+    /**
+     * 【批量设置 Entry】
+     * 用于从 JSONL 加载后初始化
+     */
+    public void setEntries(List<SessionEntry> newEntries) {
+        entries.clear();
+        entries.addAll(newEntries);
+        // 如果超出限制，只保留最近的
+        while (entries.size() > maxEntriesInMemory) {
+            entries.remove(0);
+        }
     }
 
     public String getKey() {

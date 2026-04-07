@@ -215,6 +215,22 @@ public class PromptsConfig {
             "%s\n\n" +
             "Current time: %s";
 
+    // ========== Compaction Entry Token 计算 ==========
+    // TODO System Prompt计算 待完善
+    /** System Prompt 的固定 Token 开销估算 */
+    private static final int COMPACTION_SYSTEM_PROMPT_TOKENS = 1000;
+
+    /**
+     * 【计算 Compaction Entry 的总 Token 数】
+     *
+     * @param completionTokens LLM 生成的摘要 tokens（completion_tokens）
+     * @return totalTokens = completionTokens + System Prompt
+     */
+    public static int calculateCompactionTotalTokens(int completionTokens) {
+        return completionTokens + COMPACTION_SYSTEM_PROMPT_TOKENS;
+    }
+
+
     private PromptsConfig() {
         // 工具类，禁止实例化
     }

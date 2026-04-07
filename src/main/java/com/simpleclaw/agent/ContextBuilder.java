@@ -4,8 +4,9 @@ import com.simpleclaw.agent.skills.SkillsLoader;
 import com.simpleclaw.agent.skills.model.Skill;
 import com.simpleclaw.config.model.PromptsConfig;
 import com.simpleclaw.config.model.SkillsConfig;
-import com.simpleclaw.session.JsonlSessionStore;
+import com.simpleclaw.session.SessionManager;
 import com.simpleclaw.session.model.SessionEntry;
+import lombok.extern.slf4j.Slf4j;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -32,6 +33,7 @@ import java.util.Map;
  * - LLM 通过 memory_search 工具主动搜索记忆
  * - LLM 通过 memory_get 工具读取具体文件内容
  */
+@Slf4j
 public class ContextBuilder {
 
     private static final String[] BOOTSTRAP_FILES = {"AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"};
@@ -83,15 +85,17 @@ public class ContextBuilder {
      *
      * 组装完整的发送给 LLM 的消息列表：
      * 1. 系统提示（基础信息 + bootstrap + skills）
-     * 2. 会话历史（从 JSONL 读取，包含压缩摘要）
+     * 2. 会话历史（从 SessionManager 内存读取，包含压缩摘要）
      * 3. 当前用户消息
      *
-     * @param jsonlStore JSONL 会话存储
+     * @param sessionManager 会话管理器
+     * @param sessionKey 会话键
      * @param currentMessage 当前用户消息
      * @param skillNames 启用的技能列表
      * @return 完整的消息列表
      */
-    public List<Map<String, Object>> buildChatContext(JsonlSessionStore jsonlStore,
+    public List<Map<String, Object>> buildChatContext(SessionManager sessionManager,
+                                                       String sessionKey,
                                                        String currentMessage,
                                                        List<String> skillNames) {
         // 【步骤 1】构建系统提示
@@ -105,8 +109,8 @@ public class ContextBuilder {
         systemMsg.put("content", systemPrompt);
         messages.add(systemMsg);
 
-        // 【步骤 2】从 JSONL 获取会话历史（包含压缩摘要处理）
-        List<Map<String, Object>> history = buildHistoryFromJsonl(jsonlStore);
+        // 【步骤 2】从 SessionManager 获取会话历史（包含压缩摘要处理）
+        List<Map<String, Object>> history = buildHistoryFromSession(sessionManager, sessionKey);
         messages.addAll(history);
 
         // 【步骤 3】添加当前用户消息
@@ -150,13 +154,15 @@ public class ContextBuilder {
      *
      * 用于生成长期记忆的提示：
      * 1. Memory Flush 系统提示
-     * 2. 会话历史（从 JSONL 读取）
+     * 2. 会话历史（从 SessionManager 读取）
      *
-     * @param jsonlStore JSONL 会话存储
+     * @param sessionManager 会话管理器
+     * @param sessionKey 会话键
      * @param dateStamp 日期戳
      * @return 记忆提取提示消息列表
      */
-    public List<Map<String, Object>> buildMemoryFlushContext(JsonlSessionStore jsonlStore,
+    public List<Map<String, Object>> buildMemoryFlushContext(SessionManager sessionManager,
+                                                              String sessionKey,
                                                               String dateStamp) {
         List<Map<String, Object>> messages = new ArrayList<>();
 
@@ -167,8 +173,8 @@ public class ContextBuilder {
         );
         messages.add(Map.of("role", "system", "content", systemPrompt));
 
-        // 【步骤 2】从 JSONL 获取会话历史
-        List<Map<String, Object>> history = buildHistoryFromJsonl(jsonlStore);
+        // 【步骤 2】从 SessionManager 获取会话历史
+        List<Map<String, Object>> history = buildHistoryFromSession(sessionManager, sessionKey);
         messages.addAll(history);
 
         return messages;
@@ -177,30 +183,32 @@ public class ContextBuilder {
     /**
      * 【获取原始消息列表】CompactionChecker 使用
      *
-     * 仅返回从 JSONL 读取的消息列表（不含系统提示），用于 Token 估算
+     * 仅返回从 SessionManager 读取的消息列表（不含系统提示），用于 Token 估算
      *
-     * @param jsonlStore JSONL 会话存储
+     * @param sessionManager 会话管理器
+     * @param sessionKey 会话键
      * @return 消息列表（包含压缩摘要处理）
      */
-    public List<Map<String, Object>> getMessagesForTokenEstimation(JsonlSessionStore jsonlStore) {
-        return buildHistoryFromJsonl(jsonlStore);
+    public List<Map<String, Object>> getMessagesForTokenEstimation(SessionManager sessionManager, String sessionKey) {
+        return buildHistoryFromSession(sessionManager, sessionKey);
     }
 
     // ==================== 内部方法 ====================
 
     /**
-     * 【从 JSONL 构建历史消息】
+     * 【从 SessionManager 构建历史消息】
      *
      * 核心逻辑：
      * 1. 查找最后一个 compaction entry
      * 2. 如果有 compaction，注入摘要 + 从 firstKeptEntryId 开始的消息
      * 3. 如果没有 compaction，返回所有消息
      *
-     * @param jsonlStore JSONL 会话存储
+     * @param sessionManager 会话管理器
+     * @param sessionKey 会话键
      * @return 历史消息列表（不含系统提示）
      */
-    private List<Map<String, Object>> buildHistoryFromJsonl(JsonlSessionStore jsonlStore) {
-        List<SessionEntry> allEntries = jsonlStore.readAllEntries();
+    private List<Map<String, Object>> buildHistoryFromSession(SessionManager sessionManager, String sessionKey) {
+        List<SessionEntry> allEntries = sessionManager.getAllEntries(sessionKey);
 
         if (allEntries.isEmpty()) {
             return Collections.emptyList();
@@ -293,6 +301,17 @@ public class ContextBuilder {
         }
 
         // 【技能定义】使用三段式降级策略
+        // 1. 获取常驻技能（always=true）并加载其内容注入 System Prompt
+        List<String> alwaysSkillNames = skillsLoader.getAlwaysSkills();
+        if (!alwaysSkillNames.isEmpty()) {
+            String alwaysSkillsContent = skillsLoader.loadSkillsForContext(alwaysSkillNames);
+            if (!alwaysSkillsContent.isEmpty()) {
+                sb.append("\n=== Always-Loaded Skills ===\n\n");
+                sb.append(alwaysSkillsContent).append("\n");
+            }
+        }
+
+        // 2. 获取启用的技能列表（用于 <available_skills> 展示）
         List<Skill> enabledSkills = skillsLoader.getEnabledSkills(skillFilter);
         if (!enabledSkills.isEmpty()) {
             int maxChars = skillsConfig.getMaxSkillsPromptChars() > 0

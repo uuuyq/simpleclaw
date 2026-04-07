@@ -114,12 +114,21 @@ public class MemoryManager {
         DocumentChunker chunker = enabled ? new DocumentChunker() : null;
 
         // 【初始化子服务】
+        // 【初始化 MemoryIndexService】必须在 flushService 之前
+        this.indexService = enabled ? new MemoryIndexService(
+                workspace,
+                memoryDir,
+                chunker,
+                vectorStore,
+                embeddingProvider
+        ) : null;
+
         this.compactionService = new SessionCompactionService(
                 workspace,
                 llmProvider,
                 agentConfig.getModel(),
                 sessionManager,
-                agentConfig.getMaxTokens(),
+                agentConfig.getContextWindow(),
                 agentConfig,
                 contextBuilder,
                 getToolDefinitions
@@ -130,21 +139,14 @@ public class MemoryManager {
                 llmProvider,
                 agentConfig.getModel(),
                 agentConfig,
-                contextBuilder
+                contextBuilder,
+                indexService
         );
 
         this.retrievalService = enabled ? new MemoryRetrievalService(
                 vectorStore,
                 embeddingProvider,
                 agentConfig
-        ) : null;
-
-        this.indexService = enabled ? new MemoryIndexService(
-                workspace,
-                memoryDir,
-                chunker,
-                vectorStore,
-                embeddingProvider
         ) : null;
 
         // 【确保记忆目录存在】
@@ -190,6 +192,13 @@ public class MemoryManager {
     }
 
     /**
+     * 【获取压缩检查器】
+     */
+    public CompactionChecker getCompactionChecker() {
+        return compactionService.getCompactionChecker();
+    }
+
+    /**
      * 【索引记忆目录】
      *
      * 委托给 MemoryIndexService 执行
@@ -207,26 +216,28 @@ public class MemoryManager {
      * 【检查并执行会话压缩】
      *
      * 完整的压缩流程：
-     * 1. Token 预估
+     * 1. Token 预估（两层架构）
      * 2. 判断是否需要压缩（同时输出上下文窗口日志）
      * 3. 触发 Memory Flush 和压缩（两者同时触发）
      *
      * @param session 当前会话
-     * @param jsonlStore JSONL 会话存储
+     * @param messages 内存中的消息列表（用于第二层兜底）
+     * @param sessionManager 会话管理器（用于第一层内存缓存）
      * @param newMessageContent 新消息内容（用于日志显示）
      * @return 预估的 Token 总数（用于上层日志记录）
      */
-    public int checkAndCompact(Session session, JsonlSessionStore jsonlStore, String newMessageContent) {
-        // 【步骤 1】Token 预估：三层递降 Token 估算
+    public int checkAndCompact(Session session, List<Map<String, Object>> messages,
+                               SessionManager sessionManager, String newMessageContent) {
+        // 【步骤 1】Token 预估：两层递降 Token 估算
         int estimatedTokens = compactionService.getCompactionChecker()
-                .calculateProjectedTokens(jsonlStore, newMessageContent);
+                .calculateProjectedTokens(messages, sessionManager, session.getKey(), newMessageContent);
 
         // 【步骤 2】判断是否需要压缩，同时获取详细的上下文窗口信息
         CompactionChecker.CompactionCheckResult checkResult = compactionService.getCompactionChecker()
-                .checkCompactionNeeded(estimatedTokens, agentConfig.getMaxTokens());
+                .checkCompactionNeeded(estimatedTokens, agentConfig.getContextWindow());
 
-        // 【输出上下文窗口占用日志】
-        logContextWindowUsage(session.getKey(), checkResult);
+//        // 【输出上下文窗口占用日志】
+//        logContextWindowUsage(session.getKey(), checkResult);
 
         if (!checkResult.isNeeded()) {
             return estimatedTokens;
@@ -237,8 +248,12 @@ public class MemoryManager {
 
         // 【步骤 3】触发 Memory Flush 和压缩（两者同时触发）
         log.info("[MemoryManager] 触发 Memory Flush: session={}", session.getKey());
-        flushService.flushMemory(session, jsonlStore);
+        flushService.flushMemory(session, sessionManager);
+        JsonlSessionStore jsonlStore = sessionManager.getJsonlStore(session.getKey());
         compactionService.maybeConsolidateByTokens(session, jsonlStore);
+
+        // 【步骤 4】压缩后刷新内存中的 entry
+        sessionManager.reloadEntries(session.getKey());
 
         return estimatedTokens;
     }

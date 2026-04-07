@@ -41,8 +41,8 @@ public class SessionEntry {
         @JsonProperty("header") HEADER,
         @JsonProperty("message") MESSAGE,
         @JsonProperty("compaction") COMPACTION,
-        @JsonProperty("model_change") MODEL_CHANGE,
-        @JsonProperty("session_info") SESSION_INFO
+//        @JsonProperty("model_change") MODEL_CHANGE,
+//        @JsonProperty("session_info") SESSION_INFO
     }
     
     /** Entry 类型（必需） */
@@ -64,9 +64,9 @@ public class SessionEntry {
     /** 消息内容 */
     private String content;
     
-    /** Token 使用量统计 */
-    private TokenUsage usage;
-    
+    /** 累计的总 Token 数（用于 Token 计算缓存） */
+    private Integer totalTokens;
+
     /** 工具调用列表 */
     private List<Map<String, Object>> toolCalls;
     
@@ -99,22 +99,10 @@ public class SessionEntry {
     private String newModel;
     
     // ========== Session Info 类型字段 ==========
-    
+
     /** 会话元数据 */
     private Map<String, Object> metadata;
-    
-    /**
-     * Token 使用量统计
-     */
-    @Data
-    @NoArgsConstructor
-    @AllArgsConstructor
-    public static class TokenUsage {
-        private Integer promptTokens;
-        private Integer completionTokens;
-        private Integer totalTokens;
-    }
-    
+
     /**
      * 压缩详情
      */
@@ -165,23 +153,20 @@ public class SessionEntry {
         if (type != EntryType.MESSAGE) {
             throw new IllegalStateException("Cannot convert non-message entry to message map");
         }
-        
+
         Map<String, Object> message = new java.util.HashMap<>();
+        message.put("id", id);
         message.put("role", role);
         message.put("content", content);
-        
+
         if (toolCalls != null && !toolCalls.isEmpty()) {
             message.put("tool_calls", toolCalls);
         }
-        
-        if (usage != null) {
-            message.put("usage", Map.of(
-                "prompt_tokens", usage.getPromptTokens(),
-                "completion_tokens", usage.getCompletionTokens(),
-                "total_tokens", usage.getTotalTokens()
-            ));
+
+        if (totalTokens != null) {
+            message.put("total_tokens", totalTokens);
         }
-        
+
         return message;
     }
 }

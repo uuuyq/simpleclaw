@@ -16,6 +16,7 @@ public class AgentConfig {
     // ===== 模型配置 =====
     private String model;
     private int maxTokens;
+    private int contextWindow;
     private double temperature;
     private int maxToolIterations;
     private int memoryWindow;
@@ -58,6 +59,7 @@ public class AgentConfig {
         // 模型配置
         agentConfig.model = agents.getModel();
         agentConfig.maxTokens = agents.getMaxTokens();
+        agentConfig.contextWindow = agents.getContextWindow();
         agentConfig.temperature = agents.getTemperature();
         agentConfig.maxToolIterations = agents.getMaxToolIterations();
         agentConfig.memoryWindow = agents.getMemoryWindow();
@@ -93,6 +95,7 @@ public class AgentConfig {
     
     public String getModel() { return model; }
     public int getMaxTokens() { return maxTokens; }
+    public int getContextWindow() { return contextWindow; }
     public double getTemperature() { return temperature; }
     public int getMaxToolIterations() { return maxToolIterations; }
     public int getMemoryWindow() { return memoryWindow; }
@@ -168,6 +171,15 @@ public class AgentConfig {
 
     public int getRecentTurnsPreserve() {
         return qualityGuardConfig != null ? qualityGuardConfig.getRecentTurnsPreserve() : 3;
+    }
+
+    /**
+     * 【获取压缩输出因子】
+     * 控制压缩摘要的最大长度：threshold * factor
+     * 默认 0.5，即摘要不超过阈值的一半
+     */
+    public double getCompactionOutputFactor() {
+        return contextBudgetConfig != null ? contextBudgetConfig.getCompactionOutputFactor() : 0.5;
     }
 
     // ===== 技能系统配置 getter =====
